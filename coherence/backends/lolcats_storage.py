@@ -19,7 +19,7 @@ simple example, is to fetch a rss link on startup, parse it, save it and restart
 the process one hour later again. Well, on top of this, we also want to provide
 these informations as a Media Server in the UPnP/DLNA Network of course ;) .
 
-Wow. You are still reading. You must be really interessted. Then let's go.
+Wow. You are still reading. You must be really interested. Then let's go.
 """
 
 ########## NOTE:
