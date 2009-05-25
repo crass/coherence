@@ -107,6 +107,7 @@ if haz_setuptools == True:
         DVBDStore = coherence.backends.dvbd_storage:DVBDStore
         AppleTrailersStore = coherence.backends.appletrailers_storage:AppleTrailersStore
         LolcatsStore = coherence.backends.lolcats_storage:LolcatsStore
+        IplayerStore = coherence.backends.iplayer_storage:IplayerStore
         TEDStore = coherence.backends.ted_storage:TEDStore
         BBCStore = coherence.backends.bbc_storage:BBCStore
         SWR3Store = coherence.backends.swr3_storage:SWR3Store
