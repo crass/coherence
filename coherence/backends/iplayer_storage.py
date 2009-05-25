@@ -27,50 +27,189 @@ from twisted.internet import reactor
 
 from twisted.internet.threads import deferToThread
 
-from coherence.upnp.core import utils
+from coherence.upnp.core.utils import ReverseProxyUriResource, ReverseProxyResource, StaticFile, BufferFile
+from coherence import log
 from twisted.web import server
 from twisted.web.resource import Resource
 
 from urllib import urlretrieve
-from os.path import dirname,expanduser, exists
+from os.path import dirname,expanduser, exists, join, getsize
 from os import makedirs, chmod, system, popen
+import os
 from popen2 import Popen3
 
-class ProxyStream(Resource):
+QUICKTIME_MIMETYPE = 'video/mov'
 
-	def __init__(self, uri, video):
+class TestVideoProxy(ReverseProxyUriResource, log.Loggable):
+	logCategory = 'iplayer_store'
+
+	def __init__(self, video, uri, pid,
+				 cache_directory,
+				 cache_maxsize=100000000,
+				 buffer_size=2000000,
+				 fct=None, **kwargs):
+
+		ReverseProxyUriResource.__init__(self, uri)
+
+		self.pid = pid
 		self.video = video
-		self.uri = uri
-		Resource.__init__(self)
+
+		self.cache_directory = cache_directory
+		self.cache_maxsize = int(cache_maxsize)
+		self.buffer_size = int(buffer_size)
+		self.downloader = None
+
+		self.mimetype = None
+
+		self.filesize = 0
+		self.file_in_cache = False
 
 	def requestFinished(self, result):
 		""" self.connection is set in utils.ReverseProxyResource.render """
-		print "ProxyStream requestFinished"
-
-	def get_pid(self, request):
-		pid = request.uri.split("/")[-1]
-		cmd = "%s --force --stdout -n --pid %s"%(self.video.store.script_path,pid)
-		print "render",pid, cmd
-		run = Popen3(cmd, True)
-		f = open(pid,"w+b")
-		while run.poll()==-1:
-			data = run.fromchild.read(8192)
-			request.write(data)
-			f.write(data)
-		f.close()
-		print run.childerr.read()
-		print "render return",run.wait()
+		self.info("ProxyStream requestFinished",result)
+		if hasattr(self,'connection'):
+			self.connection.transport.loseConnection()
 
 	def render(self, request):
-		dfr = deferToThread(self.get_pid, request)
+
+		self.info("VideoProxy render", request)
+		self.info("VideoProxy headers:", request.getAllHeaders())
+		self.info("VideoProxy id:", self.pid)
+
+		d = request.notifyFinish()
+		d.addBoth(self.requestFinished)
+
+		reactor.callLater(0.05,self.proxyURL,request)
 		return server.NOT_DONE_YET
 
-	########## The models
+	def proxyURL(self, request):
+		self.info("request %s" % request.method)
+
+		# download stream to cache,
+		# and send it to the client in // after X bytes
+		filepath = join(self.cache_directory, self.pid)
+
+		file_is_already_available = False
+		if (exists(filepath)
+			and getsize(filepath) == self.filesize and getsize(filepath)>0):
+			res = self.renderFile(request, filepath)
+			if isinstance(res,int):
+				return res
+			request.write(res)
+			request.finish()
+		else:
+			self.downloadFile(request, filepath, None)
+			res = self.renderBufferFile (request, filepath, self.buffer_size)
+			if res == '' and request.method != 'HEAD':
+				return server.NOT_DONE_YET
+			if not isinstance(res,int):
+				request.write(res)
+			if request.method == 'HEAD':
+				request.finish()
+	
+	def renderFile(self,request,filepath):
+		self.info('Cache file available %r %r ' %(request, filepath))
+		downloadedFile = StaticFile(filepath, self.mimetype)
+		downloadedFile.type = QUICKTIME_MIMETYPE
+		downloadedFile.encoding = None
+		return downloadedFile.render(request)
+
+	def renderBufferFile (self, request, filepath, buffer_size):
+		# Try to render file(if we have enough data)
+		self.info("renderBufferFile %s" % filepath)
+		rendering = False
+		if exists(filepath) is True:
+			filesize = getsize(filepath)
+			if filesize >= buffer_size:
+				rendering = True
+				self.info("Render file", filepath, filesize, buffer_size)
+				bufferFile = BufferFile(filepath, filesize, QUICKTIME_MIMETYPE)
+				bufferFile.type = QUICKTIME_MIMETYPE
+				bufferFile.encoding = None
+				try:
+					return bufferFile.render(request)
+				except Exception,error:
+					self.info(error)
+
+		if request.method != 'HEAD':
+			self.info('Will retry later to render buffer file')
+			reactor.callLater(0.5, self.renderBufferFile, request,filepath,buffer_size)
+		return ''
+
+	def downloadFinished(self, result):
+		self.info('Download finished!')
+		self.downloader = None
+
+	def gotDownloadError(self, error, request):
+		self.info("Unable to download stream to file")
+		self.info(request)
+		self.info(error)
+
+	def get_pid(self, request, filepath):
+		cmd = "%s --force --pid %s --symlink %s --output %s"%(self.video.store.script_path,self.pid, filepath, dirname(filepath))
+		print "render",self.pid, cmd
+		system(cmd)
+		#run = Popen4(cmd, True)
+		#f = open(filepath,"w+b")
+		#run.childerr.read(128)
+		#while run.poll()==-1:
+		#	data = run.fromchild.read(128)
+		#	#request.write(data)
+		#	f.write(data)
+		#	f.flush()
+		#	print "file size",getsize(filepath),len(data)
+		#f.close()
+		#print run.childerr.read()
+		#print "render return",run.wait()
+
+	def downloadFile(self, request, filepath, callback, *args):
+		if (self.downloader is None):
+			self.info("Proxy: download data to cache file %s" % filepath)
+			self.checkCacheSize()
+			self.downloader = deferToThread(self.get_pid, request, filepath)
+			self.downloader.addCallback(self.downloadFinished)
+			self.downloader.addErrback(self.gotDownloadError, request)
+		if(callback is not None):
+			self.downloader.addCallback(callback, request, filepath, *args)
+		return self.downloader
+
+	def checkCacheSize(self):
+		cache_listdir = os.listdir(self.cache_directory)
+
+		cache_size = 0
+		for filename in cache_listdir:
+			path = "%s%s%s" % (self.cache_directory, os.sep, filename)
+			statinfo = os.stat(path)
+			cache_size += statinfo.st_size
+		self.info("Cache size: %d (max is %s)" % (cache_size, self.cache_maxsize))
+
+		if (cache_size > self.cache_maxsize):
+			cache_targetsize = self.cache_maxsize * 2/3
+			self.info("Cache above max size: Reducing to %d" % cache_targetsize)
+
+			def compare_atime(filename1, filename2):
+				path1 = "%s%s%s" % (self.cache_directory, os.sep, filename1)
+				path2 = "%s%s%s" % (self.cache_directory, os.sep, filename2)
+				cmp = int(os.stat(path1).st_atime - os.stat(path2).st_atime)
+				return cmp
+			cache_listdir = sorted(cache_listdir,compare_atime)
+
+			while (cache_size > cache_targetsize):
+				filename = cache_listdir.pop(0)
+				path = "%s%s%s" % (self.cache_directory, os.sep, filename)
+				cache_size -= os.stat(path).st_size
+				os.remove(path)
+				self.info("removed %s" % filename)
+
+			self.info("new cache size is %d" % cache_size)
+
+########## The models
 # After the download and parsing of the data is done, we want to save it. In
 # this case, we want to fetch the videos and store their URL and the title of
 # the image. That is the IplayerVideo class:
 
 class IplayerVideo(BackendItem):
+	logCategory = 'iplayer_store'
 	# We inherit from BackendItem as it already contains a lot of helper methods
 	# and implementations. For this simple example, we only have to fill the
 	# item with data.
@@ -89,7 +228,8 @@ class IplayerVideo(BackendItem):
 		self.id = id					# each item has its own and unique id
 
 		self.url = self.store.urlbase + pid
-		self.location = ProxyStream(self.url, self) # the url of the picture
+		self.location = TestVideoProxy(self, self.url, pid,
+								self.store.cache_directory, self.store.cache_maxsize,self.store.buffer_size)
 
 		self.name = unicode(title,"utf8","ignore")   # the title of the picture. Inside
 										# coherence this is called 'name'
@@ -111,6 +251,7 @@ class IplayerVideo(BackendItem):
 		return self.url
 
 class IplayerContainer(BackendItem):
+	logCategory = 'iplayer_store'
 	# The IplayerContainer will hold the reference to all our IplayerImages. This
 	# kind of BackenedItem is a bit different from the normal BackendItem,
 	# because it has 'children' (the Iplayerimages). Because of that we have
@@ -172,6 +313,7 @@ class IplayerContainer(BackendItem):
 # it in the models and returning them on request.
 
 class IplayerStore(BackendStore):
+	logCategory = 'iplayer_store'
 
 	# this *must* be set. Because the (most used) MediaServer Coherence also
 	# allows other kind of Backends (like remote lights).
@@ -188,7 +330,13 @@ class IplayerStore(BackendStore):
 	def __init__(self, server, *args, **kwargs):
 		# first we inizialize our heritage
 		BackendStore.__init__(self,server,**kwargs)
-
+		
+		self.cache_directory = kwargs.get('cache_directory', '/tmp/coherence-cache')
+		if not exists(self.cache_directory):
+			makedirs(self.cache_directory)
+		self.cache_maxsize = kwargs.get('cache_maxsize', 100000000)
+		self.buffer_size = kwargs.get('buffer_size', 750000)
+ 
 		# When a Backend is initialized, the configuration is given as keyword
 		# arguments to the initialization. We receive it here as a dicitonary
 		# and allow some values to be set:
